@@ -47,7 +47,7 @@ class image_Comparateur:
     def detect_faces(self):
 
     # Charger le classifieur de visage pré-entraîné
-        ref = cv2.CascadeClassifier( cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml")
+        ref = cv2.CascadeClassifier( cv2.data.haarcascades + "haarcascade_fullbody.xml")
         ref1 = cv2.CascadeClassifier( cv2.data.haarcascades + "haarcascade_profileface.xml")
 
     # Détecter les visages
