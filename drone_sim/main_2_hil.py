@@ -12,11 +12,13 @@
 #   • Vitesse maximale atteinte (PEAK) affichée
 #   • Estimation du temps de vol restant (basée sur consommation batterie)
 #   • Mode jour / nuit toggle (touche J)
+#   • DT dynamique mesuré à chaque tick (correction jitter OS)
 # =============================================================================
 
 import sys
 import math
-
+import time      # ← ajout pour DT dynamique
+import cv2
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                               QVBoxLayout, QHBoxLayout)
 from PyQt6.QtCore    import QTimer, Qt, QPoint, QRectF
@@ -28,8 +30,12 @@ from physics_engine      import update as physics_update
 from pid_controller      import FlightPIDs
 from keyboard_controller import KeyboardController
 from pid_controller      import THROTTLE_HOVER
+
 from orientation_widget  import OrientationWidget
 from graph_widget        import GraphsWidget
+from test import image_Comparateur
+
+from hil_bridge_serial import HilBridgeSerial
 
 try:
     from hil_bridge import HilBridge, HilConfig
@@ -41,7 +47,7 @@ except ImportError:
 
 
 FPS                = 50
-DT                 = 1.0 / FPS
+DT                 = 1.0 / FPS   # utilisé uniquement pour timer.setInterval()
 ALTITUDE_DECOLLAGE = 1.5
 
 # ── Nouveaux paramètres v3 ─────────────────────────────────────────────────
@@ -228,13 +234,18 @@ class HUDWidget(QWidget):
 
         # ── État v3 ───────────────────────────────────────────────────────
         self._day_mode       = False
-        self._blink_tick     = 0          # incrémenté chaque tick (0-99)
-        self._peak_speed     = 0.0        # vitesse horizontale max atteinte
-        self._bat_prev_pct   = None       # pour calcul drain
-        self._bat_drain_rate = 0.0        # %/s EMA très lente
-        self._bat_time_rem   = None       # secondes restantes estimées
+        self._blink_tick     = 0
+        self._peak_speed     = 0.0
+        self._bat_prev_pct   = None
+        self._bat_drain_rate = 0.0
+        self._bat_time_rem   = None
 
-        # Appliquer palette nuit par défaut
+        # ── Trame UDP — snapshot de la dernière trame envoyée ─────────────
+        self._last_telem      : dict  = {}
+        self._last_telem_json : str   = ""
+        self._last_telem_bytes: int   = 0
+        self._last_telem_cnt  : int   = 0
+
         self._apply_palette_night()
 
     # ------------------------------------------------------------------
@@ -274,12 +285,19 @@ class HUDWidget(QWidget):
     def toggle_mode_ingenieur(self):
         self._mode_ing = not self._mode_ing
 
+    def set_last_telem(self, tel: dict):
+        import json as _json
+        self._last_telem       = tel
+        raw                    = _json.dumps(tel, separators=(',', ':'))
+        self._last_telem_json  = raw
+        self._last_telem_bytes = len(raw.encode())
+        self._last_telem_cnt   = tel.get("_cnt", 0)
+
     # ------------------------------------------------------------------
     # Helpers v3
     # ------------------------------------------------------------------
 
     def _blink_on(self, period_ticks=20) -> bool:
-        """Retourne True pendant la première moitié de la période."""
         return (self._blink_tick % period_ticks) < (period_ticks // 2)
 
     def _is_hovering(self) -> bool:
@@ -307,18 +325,14 @@ class HUDWidget(QWidget):
             if len(self._trail) > self.TRAIL_MAX:
                 self._trail.pop(0)
 
-        # Blink counter (50 fps → période 20 ticks = 400 ms)
         self._blink_tick = (self._blink_tick + 1) % 100
 
-        # Vitesse peak (horizontal uniquement)
         if sm.vxy > self._peak_speed:
             self._peak_speed = sm.vxy
 
-        # Estimation temps de vol restant (via drain batterie)
         if self._bat_prev_pct is not None:
-            tick_drain = self._bat_prev_pct - sm.bat_pct   # % perdu ce tick
-            drain_per_s = tick_drain * FPS                  # % par seconde
-            # EMA très lente pour éviter le bruit
+            tick_drain  = self._bat_prev_pct - sm.bat_pct
+            drain_per_s = tick_drain * FPS
             self._bat_drain_rate = _ema(
                 self._bat_drain_rate, max(0.0, drain_per_s), BAT_DRAIN_ALPHA)
             if self._bat_drain_rate > 1e-4:
@@ -372,7 +386,7 @@ class HUDWidget(QWidget):
 
         p.fillRect(0, 0, w, h, self.C_BG)
 
-        HDR_H   = 44      # légèrement plus haut pour chrono
+        HDR_H   = 44
         BOT_H   = self.BOT_H
         LEFT_W  = 156
         RIGHT_W = 86
@@ -394,7 +408,7 @@ class HUDWidget(QWidget):
             self._draw_hil_overlay(p, w, h)
 
     # ==================================================================
-    # Header  — chrono XXL, mode vol, peak speed, temps restant
+    # Header
     # ==================================================================
 
     def _draw_header(self, p, x, y, w, h):
@@ -405,7 +419,6 @@ class HUDWidget(QWidget):
         p.setPen(QPen(self.C_BORDER, 1))
         p.drawLine(x, y+h-1, x+w, y+h-1)
 
-        # ── Pastille mode vol ─────────────────────────────────────────
         MODE_COL = {
             DroneState.MODE_SOL:       QColor("#464A58"),
             DroneState.MODE_DECOLLAGE: QColor("#9E8030"),
@@ -422,7 +435,6 @@ class HUDWidget(QWidget):
         p.setPen(QPen(mc))
         p.drawText(x+4, y+4, bw, h-8, Qt.AlignmentFlag.AlignCenter, s.mode_vol)
 
-        # ── Indicateur HOLD ───────────────────────────────────────────
         if self._is_hovering():
             hx = x + bw + 12
             p.fillRect(hx, y+10, 44, h-20, QColor(64, 200, 128, 40))
@@ -432,13 +444,11 @@ class HUDWidget(QWidget):
             p.setPen(QPen(self.C_GREEN))
             p.drawText(hx, y+10, 44, h-20, Qt.AlignmentFlag.AlignCenter, "HOLD")
 
-        # ── Indicateur d'attitude (pastille couleur) ──────────────────
         ac = self._att_color()
         p.setBrush(QColor(ac.red(), ac.green(), ac.blue(), 180))
         p.setPen(QPen(ac, 0.5))
         p.drawEllipse(x+166, y+h//2-5, 10, 10)
 
-        # ── Chrono XXL centré ─────────────────────────────────────────
         mn  = int(s.temps_vol // 60)
         sc_ = int(s.temps_vol % 60)
         yaw_deg = math.degrees(sm.yaw) % 360
@@ -451,7 +461,6 @@ class HUDWidget(QWidget):
         p.drawText(x, y+h-13, w, 12, Qt.AlignmentFlag.AlignCenter,
                    f"CAP  {yaw_deg:05.1f}°")
 
-        # ── Bloc droite : batterie + peak speed + temps restant ───────
         hil_txt = ""
         if self._hil_ref and HIL_DISPONIBLE and self._hil_ref.actif:
             st = self._hil_ref.stats
@@ -460,21 +469,18 @@ class HUDWidget(QWidget):
 
         bc = self._bat_color()
 
-        # Peak speed
         p.setPen(QPen(self.C_YELLOW))
         p.setFont(QFont("Monospace", 8))
         p.drawText(x, y+4, w-8, 12,
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
                    f"PEAK {self._peak_speed:.1f} m/s")
 
-        # Batterie + tension
         p.setPen(QPen(bc))
         p.setFont(QFont("Monospace", 9, QFont.Weight.Bold))
         p.drawText(x, y+h//2-6, w-8, 14,
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    f"{sm.bat_pct:.0f}%  {sm.bat_v:.1f}V{hil_txt}")
 
-        # Temps restant estimé
         if self._bat_time_rem is not None and s.moteurs_armes:
             rem_m = int(self._bat_time_rem // 60)
             rem_s = int(self._bat_time_rem % 60)
@@ -486,7 +492,6 @@ class HUDWidget(QWidget):
                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom,
                        f"~{rem_m:02d}:{rem_s:02d} restant")
 
-        # Mode jour/nuit indicator
         day_lbl = "☀ JOUR" if self._day_mode else "☾ NUIT"
         p.setPen(QPen(QColor(180, 180, 140, 120)))
         p.setFont(QFont("Monospace", 7))
@@ -570,7 +575,7 @@ class HUDWidget(QWidget):
             p.setPen(QPen(self.C_MUTED)); p.drawText(x+40, yy, a)
 
     # ==================================================================
-    # Horizon artificiel  —  + vario + scanlines + glide path
+    # Horizon artificiel
     # ==================================================================
 
     def _draw_horizon(self, p, x, y, w, h):
@@ -580,12 +585,9 @@ class HUDWidget(QWidget):
         cy = y + h//2
         ac = self._att_color()
 
-        VARIO_W    = 26    # largeur de la barre vario (côté droit)
-        VARIO_MARG = 4     # marge droite
-        TAPE_H     = 30    # hauteur ruban cap
-
-        # Zone horizon effective (sans vario)
-        horiz_w = w - VARIO_W - VARIO_MARG
+        VARIO_W    = 26
+        VARIO_MARG = 4
+        horiz_w    = w - VARIO_W - VARIO_MARG
 
         offset_pitch = int(math.degrees(sm.pitch) * 3.5)
 
@@ -593,7 +595,6 @@ class HUDWidget(QWidget):
         p.setClipRect(x, y, w, h)
         p.fillRect(x, y, w, h, self.C_BG)
 
-        # ── Ciel/sol et lignes de pitch ───────────────────────────────
         p.save()
         p.setClipRect(x+2, y+2, horiz_w-4, h-4)
         p.translate(cx - (VARIO_W + VARIO_MARG)//2, cy + offset_pitch)
@@ -617,7 +618,6 @@ class HUDWidget(QWidget):
                 p.drawText(-ll-24, py_+4, f"{deg:+}°")
         p.restore()
 
-        # ── Scanlines militaires ──────────────────────────────────────
         sl_alpha = 12 if not self._day_mode else 8
         p.save()
         p.setClipRect(x+2, y+2, horiz_w-4, h-4)
@@ -626,7 +626,6 @@ class HUDWidget(QWidget):
             p.drawLine(x+2, sy, x+horiz_w-2, sy)
         p.restore()
 
-        # ── FPM ──────────────────────────────────────────────────────
         cx_h = x + horiz_w//2
         fpm_px = cx_h + int(sm.fpm_x)
         fpm_py = cy - int(sm.fpm_y) + offset_pitch
@@ -640,7 +639,6 @@ class HUDWidget(QWidget):
         p.drawLine(fpm_px-R, fpm_py,   fpm_px-R-5, fpm_py)
         p.drawLine(fpm_px+R, fpm_py,   fpm_px+R+5, fpm_py)
 
-        # ── Chevron fixe ──────────────────────────────────────────────
         chevron_c = QColor(160, 140, 90, 180)
         p.setPen(QPen(chevron_c, 1.5))
         p.drawLine(cx_h-52, cy, cx_h-16, cy)
@@ -653,40 +651,32 @@ class HUDWidget(QWidget):
 
         self._draw_roll_arc(p, cx_h, y+22, 58, sm.roll, chevron_c)
 
-        # ── Glide path — mode atterrissage ────────────────────────────
         if s.mode_vol in (DroneState.MODE_ATTERRO, DroneState.MODE_DECOLLAGE):
             gp_col = QColor(100, 220, 130, 180)
-            gp_px  = int(GLIDE_SLOPE_DEG * 3.5)   # pixels en dessous du centre
+            gp_px  = int(GLIDE_SLOPE_DEG * 3.5)
             glide_y = cy + gp_px
-            # Ligne horizontale pointillée = plan de descente idéal
             p.setPen(QPen(gp_col, 1.0, Qt.PenStyle.DashLine))
             p.drawLine(x+30, glide_y, x+horiz_w-60, glide_y)
-            # Losange central sur la ligne
             p.setPen(QPen(gp_col, 1.2))
             gd = 5
             p.drawLine(cx_h-gd, glide_y, cx_h, glide_y-gd)
             p.drawLine(cx_h, glide_y-gd, cx_h+gd, glide_y)
             p.drawLine(cx_h+gd, glide_y, cx_h, glide_y+gd)
             p.drawLine(cx_h, glide_y+gd, cx_h-gd, glide_y)
-            # Label
             p.setPen(QPen(gp_col))
             p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
             p.drawText(cx_h+gd+4, glide_y+4, f"GS {GLIDE_SLOPE_DEG:.0f}°")
-            # Flèche descent depuis le chevron vers la ligne GP
             arr_col = QColor(100, 220, 130, 90)
             p.setPen(QPen(arr_col, 0.8, Qt.PenStyle.DotLine))
             p.drawLine(cx_h, cy, cx_h, glide_y-gd-1)
 
-        # ── Bordure colorée attitude ──────────────────────────────────
         border_alpha = int(20 + sm.att_t * 160)
         border_c = QColor(ac.red(), ac.green(), ac.blue(), border_alpha)
         p.setPen(QPen(border_c, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(x+2, y+2, horiz_w-4, h-4)
 
-        # ── Ruban de cap ──────────────────────────────────────────────
         self._draw_heading_tape(p, x, y, horiz_w, h, sm.yaw)
 
-        # ── Labels flottants ──────────────────────────────────────────
         p.setPen(QPen(self.C_MUTED)); p.setFont(QFont("Monospace", 7))
         p.drawText(x+6, y+12, "HORIZON  ● FPM")
         spd_col = QColor(self.C_YELLOW.red(), self.C_YELLOW.green(),
@@ -700,38 +690,34 @@ class HUDWidget(QWidget):
         p.drawText(x+horiz_w-86, y+2, 80, 20, Qt.AlignmentFlag.AlignRight,
                    f"{sm.alt:.1f} m")
 
-        p.restore()   # fin clip général
+        p.restore()
 
-        # ── Vario bar (dessiné APRÈS restore pour ne pas être clippé) ──
         self._draw_vario(p, x + horiz_w + VARIO_MARG//2, y, VARIO_W, h, sm.vz)
 
     # ------------------------------------------------------------------
-    # Vario (indicateur vitesse verticale)
+    # Vario
     # ------------------------------------------------------------------
 
     def _draw_vario(self, p, x, y, w, h, vz: float):
-        """Barre verticale graduée ±VARIO_RANGE m/s, dessinée à droite de l'horizon."""
-        MARG_V = 20    # marges haut/bas
+        MARG_V = 20
         bar_h  = h - MARG_V * 2
         bar_x  = x + (w - 16) // 2
         bar_w  = 16
         cy     = y + h // 2
 
-        # Fond
         p.fillRect(x, y, w, h, QColor(self.C_BG.red(), self.C_BG.green(),
                                        self.C_BG.blue(), 220))
         p.setPen(QPen(self.C_BORDER, 0.5))
         p.drawRect(bar_x, y+MARG_V, bar_w, bar_h)
 
-        # Remplissage coloré selon VZ
         vz_clamped = _clamp(vz, -VARIO_RANGE, VARIO_RANGE)
-        fill_ratio  = vz_clamped / VARIO_RANGE    # -1..+1
+        fill_ratio  = vz_clamped / VARIO_RANGE
         fill_px     = int(abs(fill_ratio) * bar_h / 2)
 
-        if fill_ratio >= 0:  # montée → vert
+        if fill_ratio >= 0:
             bar_top = cy - fill_px
             vz_bar_col = self.C_GREEN
-        else:                # descente → orange/rouge
+        else:
             bar_top = cy
             vz_bar_col = _lerp_color(self.C_ORANGE, self.C_RED,
                                      _clamp(abs(fill_ratio) - 0.5, 0, 1) * 2)
@@ -741,12 +727,10 @@ class HUDWidget(QWidget):
                        QColor(vz_bar_col.red(), vz_bar_col.green(),
                               vz_bar_col.blue(), 200))
 
-        # Ligne zéro (centre)
         p.setPen(QPen(QColor(self.C_WHITE.red(), self.C_WHITE.green(),
                              self.C_WHITE.blue(), 160), 1.0))
         p.drawLine(bar_x-2, cy, bar_x+bar_w+2, cy)
 
-        # Graduations : ±1, ±2, ±3, ±4 m/s
         p.setFont(QFont("Monospace", 6))
         for grad in range(1, int(VARIO_RANGE)+1):
             gy_up   = cy - int(grad / VARIO_RANGE * bar_h / 2)
@@ -762,7 +746,6 @@ class HUDWidget(QWidget):
                 p.drawText(bar_x+bar_w+2, gy_up+3, f"{grad}")
                 p.drawText(bar_x+bar_w+2, gy_down+3, f"-{grad}")
 
-        # Indicateur valeur courante (flèche triangulaire)
         ind_y = _clamp(cy - int(fill_ratio * bar_h / 2), y+MARG_V+1, y+h-MARG_V-1)
         ind_col = vz_bar_col
         p.setBrush(QColor(ind_col.red(), ind_col.green(), ind_col.blue(), 230))
@@ -773,7 +756,6 @@ class HUDWidget(QWidget):
             QPoint(bar_x,   ind_y+4),
         ]))
 
-        # Valeur numérique
         p.setPen(QPen(ind_col))
         p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
         p.drawText(x, y+h-14, w, 12, Qt.AlignmentFlag.AlignCenter,
@@ -782,7 +764,7 @@ class HUDWidget(QWidget):
         p.drawText(x, y+2, w, 12, Qt.AlignmentFlag.AlignCenter, "VZ")
 
     # ------------------------------------------------------------------
-    # Heading tape & roll arc  (identiques à v2)
+    # Heading tape & roll arc
     # ------------------------------------------------------------------
 
     def _draw_heading_tape(self, p, x, y, w, h, yaw):
@@ -863,7 +845,7 @@ class HUDWidget(QWidget):
         p.restore()
 
     # ==================================================================
-    # Radar  —  cercles 10/20/30 m, vecteur cap, zone sécurité
+    # Radar
     # ==================================================================
 
     def _draw_radar(self, p, x, y, w, h):
@@ -874,14 +856,10 @@ class HUDWidget(QWidget):
 
         cx = x + w//2; cy = y + h//2
         rayon = min(w, h)//2 - 14
-
-        # ── Échelle : 30 m = rayon complet ───────────────────────────
         echelle = rayon / 30.0
 
-        # ── Cercles de distance avec labels 10/20/30 m ───────────────
         for dist_m in [10, 20, 30]:
             r_px = int(dist_m * echelle)
-            # Zone de sécurité : rouge si dist_m == 30 (= SAFETY_DIST arrondi)
             if dist_m * echelle >= SAFETY_DIST * echelle:
                 ring_col = QColor(180, 50, 50, 80)
                 p.setPen(QPen(ring_col, 1.0, Qt.PenStyle.DashLine))
@@ -890,7 +868,6 @@ class HUDWidget(QWidget):
                 p.setPen(QPen(ring_col, 0.6))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(cx-r_px, cy-r_px, r_px*2, r_px*2)
-            # Label de distance
             lbl_col = QColor(180, 50, 50, 160) if dist_m >= SAFETY_DIST else \
                       QColor(self.C_MUTED.red(), self.C_MUTED.green(),
                              self.C_MUTED.blue(), 130)
@@ -898,32 +875,27 @@ class HUDWidget(QWidget):
             p.setFont(QFont("Monospace", 6))
             p.drawText(cx + r_px + 3, cy - 4, f"{dist_m}m")
 
-        # Croix centrale
         p.setPen(QPen(QColor(38, 42, 55, 180), 0.5))
         p.drawLine(cx-rayon, cy, cx+rayon, cy)
         p.drawLine(cx, cy-rayon, cx, cy+rayon)
 
-        # Points cardinaux
         p.setPen(QPen(self.C_MUTED)); p.setFont(QFont("Monospace", 7))
         p.drawText(cx-4, y+h-rayon-2, "N")
         p.drawText(cx-4, y+rayon+13,  "S")
         p.drawText(cx+rayon+3, cy+4,  "E")
         p.drawText(cx-rayon-9, cy+4,  "W")
 
-        # ── Zone de sécurité rouge si drone trop loin ─────────────────
         dist_actual = s.distance_origine
         if dist_actual > SAFETY_DIST:
             safe_r = int(SAFETY_DIST * echelle)
             p.setPen(QPen(QColor(200, 50, 50, 100), 1.5, Qt.PenStyle.DashLine))
             p.setBrush(QColor(180, 40, 40, 18))
             p.drawEllipse(cx-safe_r, cy-safe_r, safe_r*2, safe_r*2)
-            # Texte d'alerte
             p.setPen(QPen(QColor(200, 60, 60, 180)))
             p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
             p.drawText(cx-30, cy-safe_r-14, 60, 12,
                        Qt.AlignmentFlag.AlignCenter, "⚠ HORS ZONE")
 
-        # ── Traîne de trajectoire ─────────────────────────────────────
         if len(self._trail) > 1:
             for i in range(1, len(self._trail)):
                 ax, ay = self._trail[i-1]; bx, by = self._trail[i]
@@ -937,15 +909,12 @@ class HUDWidget(QWidget):
                     cy - int(_clamp(by*echelle, -rayon+8, rayon-8)),
                 )
 
-        # Position drone
         dx = int(_clamp(s.position.x * echelle, -rayon+8, rayon-8))
         dy = int(_clamp(-s.position.y * echelle, -rayon+8, rayon-8))
 
-        # Ligne de position (orignie → drone)
         p.setPen(QPen(QColor(91, 207, 234, 35), 0.5, Qt.PenStyle.DotLine))
         p.drawLine(cx, cy, cx+dx, cy+dy)
 
-        # ── Vecteur vitesse (jaune) ───────────────────────────────────
         vscale = echelle * 1.0
         vdx = int(_clamp(sm.vx * vscale, -rayon, rayon))
         vdy = int(_clamp(-sm.vy * vscale, -rayon, rayon))
@@ -954,13 +923,11 @@ class HUDWidget(QWidget):
                                  self.C_YELLOW.blue(), 170), 1.2))
             p.drawLine(cx+dx, cy+dy, cx+dx+vdx, cy+dy+vdy)
 
-        # ── Vecteur cap / yaw (violet clair, depuis la position drone) ─
-        yaw_len = 18    # longueur fixe en pixels
+        yaw_len = 18
         yaw_vx  = int(yaw_len * math.sin(s.yaw))
         yaw_vy  = int(-yaw_len * math.cos(s.yaw))
         p.setPen(QPen(QColor(160, 120, 220, 190), 1.2))
         p.drawLine(cx+dx, cy+dy, cx+dx+yaw_vx, cy+dy+yaw_vy)
-        # Pointe de flèche (petit triangle)
         tip_x = cx + dx + yaw_vx
         tip_y = cy + dy + yaw_vy
         p.setBrush(QColor(160, 120, 220, 180))
@@ -971,10 +938,8 @@ class HUDWidget(QWidget):
         p.drawPolygon(QPolygon([QPoint(0,-4), QPoint(-3,3), QPoint(3,3)]))
         p.restore()
 
-        # ── Curseur drone ─────────────────────────────────────────────
         self._drone_triangle(p, cx+dx, cy+dy, sm.yaw)
 
-        # Infos bas radar
         p.setPen(QPen(self.C_MUTED)); p.setFont(QFont("Monospace", 8))
         p.drawText(x+5, y+h-5, f"Dist {sm.dist:.1f} m  ▷ cap  ⟶ vit")
 
@@ -1068,7 +1033,6 @@ class HUDWidget(QWidget):
         BAT_W   = 210
         MOT_W   = w - BAT_W - MARG * 3
 
-        # ── Zone moteurs ──────────────────────────────────────────────
         mot_x  = x + MARG
         mot_y  = y + MARG
         mot_h  = h - MARG * 2
@@ -1100,19 +1064,16 @@ class HUDWidget(QWidget):
             p.drawText(bx, by+bar_h+22, bar_w, 10,
                        Qt.AlignmentFlag.AlignCenter, f"M{i+1}")
 
-        # ── Séparateur ────────────────────────────────────────────────
         sep_x = mot_x + MOT_W + MARG
         p.setPen(QPen(self.C_BORDER, 1))
         p.drawLine(sep_x, y+4, sep_x, y+h-4)
 
-        # ── Bloc batterie proéminent ───────────────────────────────────
         bat_x = sep_x + MARG
         bat_y = y + MARG
         bc    = self._bat_color()
         pct   = sm.bat_pct
         volt  = sm.bat_v
 
-        # Clignotement batterie critique
         bat_visible = True
         if pct < BAT_CRIT_PCT:
             bat_visible = self._blink_on(period_ticks=25)
@@ -1140,7 +1101,6 @@ class HUDWidget(QWidget):
             p.drawText(bat_x + jau_w2//2, jau_y+jau_h2+8, jau_w2//2, 22,
                        Qt.AlignmentFlag.AlignRight, f"{volt:.2f}V")
 
-        # Statut batterie
         if pct > 50:
             bat_status, status_col = "✓ OK", self.C_GREEN
         elif pct > 20:
@@ -1154,7 +1114,6 @@ class HUDWidget(QWidget):
         p.drawText(bat_x, jau_y+jau_h2+32, jau_w2, 10,
                    Qt.AlignmentFlag.AlignRight, bat_status)
 
-        # Temps de vol restant estimé (sous la batterie)
         if self._bat_time_rem is not None and s.moteurs_armes:
             rem_m = int(self._bat_time_rem // 60)
             rem_s = int(self._bat_time_rem % 60)
@@ -1166,7 +1125,7 @@ class HUDWidget(QWidget):
                        Qt.AlignmentFlag.AlignLeft, tr_str)
 
     # ==================================================================
-    # Alertes overlay  —  batterie critique, VZ fort, alerte distance
+    # Alertes overlay
     # ==================================================================
 
     def _draw_alerts(self, p, x, y, w, h):
@@ -1174,17 +1133,14 @@ class HUDWidget(QWidget):
         s  = self.state
         alerts = []
 
-        # Batterie critique
         if sm.bat_pct < BAT_CRIT_PCT and self._blink_on(20):
             alerts.append(("⛔ BATTERIE CRITIQUE", self.C_RED))
 
-        # VZ trop élevée en descente
         if (s.mode_vol in (DroneState.MODE_ATTERRO, DroneState.MODE_VOL)
                 and sm.vz < -VZ_HARD_LANDING
                 and self._blink_on(15)):
             alerts.append((f"⚠ DESCENTE RAPIDE  {abs(sm.vz):.1f} m/s", self.C_ORANGE))
 
-        # Hors zone
         if s.distance_origine > SAFETY_DIST and self._blink_on(25):
             alerts.append((f"⚠ HORS ZONE  {s.distance_origine:.0f} m", QColor("#D4823C")))
 
@@ -1196,7 +1152,7 @@ class HUDWidget(QWidget):
         ax = w // 2 - ALERT_W // 2
 
         for idx, (msg, col) in enumerate(alerts):
-            ay = y + 52 + idx * (ALERT_H + 4)   # sous le header
+            ay = y + 52 + idx * (ALERT_H + 4)
             p.fillRect(ax, ay, ALERT_W, ALERT_H,
                        QColor(col.red(), col.green(), col.blue(), 55))
             p.setPen(QPen(col, 1.2))
@@ -1207,18 +1163,19 @@ class HUDWidget(QWidget):
                        Qt.AlignmentFlag.AlignCenter, msg)
 
     # ==================================================================
-    # Overlay ingénieur HIL  (identique v2)
+    # Overlay ingénieur HIL
     # ==================================================================
 
     def _draw_hil_overlay(self, p, w, h):
         s   = self.state
-        OW  = 380; OH = h - 20
+        OW  = 420; OH = h - 20
         OX  = w - OW - 10; OY = 10
 
         p.fillRect(OX, OY, OW, OH, self.C_HIL_BG)
         p.setPen(QPen(QColor(self.C_CYAN.red(), self.C_CYAN.green(),
                               self.C_CYAN.blue(), 160), 1))
         p.drawRect(OX, OY, OW, OH)
+
         p.setFont(QFont("Monospace", 9, QFont.Weight.Bold))
         p.setPen(QPen(self.C_CYAN))
         p.drawText(OX+8, OY+16, "◈  MODE INGÉNIEUR — HIL BRIDGE")
@@ -1229,16 +1186,31 @@ class HUDWidget(QWidget):
         fn  = QFont("Monospace", 8)
         fb  = QFont("Monospace", 8, QFont.Weight.Bold)
 
-        def ligne(label, val, col=None):
+        def sep():
             nonlocal y_o
-            p.setFont(fn); p.setPen(QPen(self.C_HIL_TXT)); p.drawText(OX+10, y_o, label)
-            p.setFont(fb); p.setPen(QPen(col or self.C_WHITE)); p.drawText(OX+160, y_o, val)
+            y_o += 4
+            p.setPen(QPen(QColor("#1E2230"), 0.5))
+            p.drawLine(OX+6, y_o, OX+OW-6, y_o)
+            y_o += 8
+
+        def titre_section(txt):
+            nonlocal y_o
+            p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
+            p.setPen(QPen(self.C_HIL_TXT))
+            p.drawText(OX+8, y_o, txt)
             y_o += lh
 
+        def ligne(label, val, col=None):
+            nonlocal y_o
+            p.setFont(fn); p.setPen(QPen(self.C_HIL_TXT))
+            p.drawText(OX+10, y_o, label)
+            p.setFont(fb); p.setPen(QPen(col or self.C_WHITE))
+            p.drawText(OX+160, y_o, val)
+            y_o += lh
+
+        titre_section("BRIDGE")
         if self._hil_ref and HIL_DISPONIBLE:
             st = self._hil_ref.stats
-            p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
-            p.setPen(QPen(self.C_HIL_TXT)); p.drawText(OX+8, y_o, "BRIDGE"); y_o += lh
             ligne("UDP",
                   f"{'CONNECTÉ' if st['udp_ok'] else 'ABSENT'}  "
                   f"envois={st['udp_sent']}  err={st['udp_errors']}",
@@ -1255,26 +1227,25 @@ class HUDWidget(QWidget):
                   "non initialisé" if not HIL_DISPONIBLE else "inactif",
                   self.C_HIL_ERR)
 
-        y_o += 4; p.setPen(QPen(QColor("#242830"), 0.5))
-        p.drawLine(OX+6, y_o, OX+OW-6, y_o); y_o += 10
-        p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
-        p.setPen(QPen(self.C_HIL_TXT))
-        p.drawText(OX+8, y_o, "PAYLOAD JSON (dernier tick)"); y_o += lh
+        sep()
+        titre_section("PAYLOAD — CHAMPS DÉCODÉS")
 
-        if hasattr(s, 'exporter_telemetrie'):
-            tel = s.exporter_telemetrie()
-        else:
-            tel = {
-                'pos': [s.position.x, s.position.y, s.position.z],
-                'vel': [s.vitesse.x, s.vitesse.y, s.vitesse.z],
-                'att_deg': [math.degrees(s.roll), math.degrees(s.pitch), math.degrees(s.yaw)],
-                'cmd': {'throttle': s.cmd_throttle, 'roll': s.cmd_roll,
-                        'pitch': s.cmd_pitch, 'yaw': s.cmd_yaw},
-                'moteurs': s.moteurs,
-                'mode': s.mode_vol, 'arme': s.moteurs_armes,
-                'bat_pct': s.batterie_pct, 'bat_v': s.batterie_tension,
-                't': s.temps_vol, '_cnt': 0,
-            }
+        tel = self._last_telem if self._last_telem else {}
+
+        if not tel:
+            if hasattr(s, 'exporter_telemetrie'):
+                tel = s.exporter_telemetrie()
+            else:
+                tel = {
+                    'pos': [s.position.x, s.position.y, s.position.z],
+                    'vel': [s.vitesse.x, s.vitesse.y, s.vitesse.z],
+                    'att_deg': [math.degrees(s.roll), math.degrees(s.pitch), math.degrees(s.yaw)],
+                    'cmd': {'throttle': s.cmd_throttle, 'roll': s.cmd_roll,
+                            'pitch': s.cmd_pitch, 'yaw': s.cmd_yaw},
+                    'moteurs': s.moteurs, 'mode': s.mode_vol, 'arme': s.moteurs_armes,
+                    'bat_pct': s.batterie_pct, 'bat_v': s.batterie_tension,
+                    't': s.temps_vol, '_cnt': 0,
+                }
 
         sections = [
             ("Position",  [f"x={tel['pos'][0]:+.3f} m",
@@ -1283,9 +1254,9 @@ class HUDWidget(QWidget):
             ("Vitesse",   [f"vx={tel['vel'][0]:+.3f} m/s",
                            f"vy={tel['vel'][1]:+.3f} m/s",
                            f"vz={tel['vel'][2]:+.3f} m/s"]),
-            ("Attitude",  [f"roll ={tel['att_deg'][0]:+.2f}°",
-                           f"pitch={tel['att_deg'][1]:+.2f}°",
-                           f"yaw  ={tel['att_deg'][2]:+.2f}°"]),
+            ("Attitude",  [f"roll ={tel.get('att_deg',[0,0,0])[0]:+.2f}°",
+                           f"pitch={tel.get('att_deg',[0,0,0])[1]:+.2f}°",
+                           f"yaw  ={tel.get('att_deg',[0,0,0])[2]:+.2f}°"]),
             ("Commandes", [f"thr={tel['cmd']['throttle']:.3f}",
                            f"roll={tel['cmd']['roll']:+.3f}",
                            f"pitch={tel['cmd']['pitch']:+.3f}",
@@ -1293,7 +1264,7 @@ class HUDWidget(QWidget):
             ("Moteurs",   [f"M1={tel['moteurs'][0]:.3f}", f"M2={tel['moteurs'][1]:.3f}",
                            f"M3={tel['moteurs'][2]:.3f}", f"M4={tel['moteurs'][3]:.3f}"]),
             ("Système",   [f"mode={tel['mode']}  armé={tel['arme']}",
-                           f"bat={tel['bat_pct']:.1f}%  {tel['bat_v']:.2f}V",
+                           f"bat={tel.get('bat_pct',0):.1f}%  {tel.get('bat_v',0):.2f}V",
                            f"t={tel['t']:.2f}s"]),
         ]
 
@@ -1306,6 +1277,51 @@ class HUDWidget(QWidget):
             for v in vals:
                 p.setPen(QPen(self.C_WHITE)); p.drawText(ox+4, yy, v); yy += 11
             yy += 4; y_col[col] = yy; col = 1 - col
+        y_o = max(y_col[0], y_col[1])
+
+        sep()
+
+        hil_cfg = self._hil_ref.cfg if self._hil_ref else None
+        host_str = (f"{hil_cfg.udp_host}:{hil_cfg.udp_port}"
+                    if hil_cfg else "127.0.0.1:5005")
+
+        p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
+        p.setPen(QPen(self.C_CYAN))
+        frame_lbl = (f"TRAME UDP BRUTE  →  {host_str}  "
+                     f"#{self._last_telem_cnt:05d}  "
+                     f"[{self._last_telem_bytes} B]")
+        p.drawText(OX+8, y_o, frame_lbl); y_o += 13
+
+        JSON_ZONE_H = OH - (y_o - OY) - 18
+        if JSON_ZONE_H > 20:
+            p.fillRect(OX+6, y_o, OW-12, JSON_ZONE_H, QColor(4, 6, 10, 220))
+            p.setPen(QPen(QColor(30, 36, 48, 200), 0.5))
+            p.drawRect(OX+6, y_o, OW-12, JSON_ZONE_H)
+
+            raw = self._last_telem_json if self._last_telem_json else \
+                  '{"status":"en attente de la première trame…"}'
+            CHARS_PER_LINE = 52
+            lines = []
+            while len(raw) > CHARS_PER_LINE:
+                cut = raw.rfind(',', 0, CHARS_PER_LINE)
+                if cut < 10: cut = CHARS_PER_LINE
+                else: cut += 1
+                lines.append(raw[:cut])
+                raw = raw[cut:]
+            if raw:
+                lines.append(raw)
+
+            p.setFont(QFont("Monospace", 6))
+            max_lines = (JSON_ZONE_H - 6) // 10
+            y_txt = y_o + 9
+            for i, ln in enumerate(lines[:max_lines]):
+                p.setPen(QPen(QColor(60, 180, 200, 200)))
+                p.drawText(OX+10, y_txt, ln)
+                y_txt += 10
+
+            if len(lines) > max_lines:
+                p.setPen(QPen(QColor("#363840")))
+                p.drawText(OX+10, y_txt, f"… +{len(lines)-max_lines} lignes")
 
         p.setFont(QFont("Monospace", 7)); p.setPen(QPen(QColor("#363840")))
         p.drawText(OX+8, OY+OH-8, "[ I ] fermer cet overlay")
@@ -1326,6 +1342,7 @@ class MainWindow(QMainWindow):
         self.state    = DroneState()
         self.pids     = FlightPIDs()
         self.keyboard = KeyboardController()
+        self._last_tick_time = time.monotonic()   # ← DT dynamique init
 
         self.hud         = HUDWidget(self.state)
         self.hud._keyboard_ref = self.keyboard
@@ -1333,6 +1350,10 @@ class MainWindow(QMainWindow):
         self.graphs      = GraphsWidget(self.state)
 
         self.hil = None
+
+        self.hil_serial = HilBridgeSerial(port="COM7")
+        self.hil_serial.demarrer()
+
         if HIL_DISPONIBLE:
             cfg = HilConfig(
                 udp_actif    = True,
@@ -1373,6 +1394,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if self.hil:
             self.hil.arreter()
+        if self.hil_serial:
+            self.hil_serial.arreter()
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
@@ -1380,6 +1403,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _tick(self):
+        # ── DT dynamique : temps réel écoulé depuis le dernier tick ──
+        now = time.monotonic()
+        dt  = now - self._last_tick_time
+        dt  = max(0.005, min(dt, 0.05))   # clamp 5 ms … 50 ms
+        self._last_tick_time = now
+
         s = self.state
         self.keyboard.update(s)
 
@@ -1388,17 +1417,21 @@ class MainWindow(QMainWindow):
             s.reset()
             self.pids.reset_all()
             self.keyboard.set_throttle_hover()
-            self.hud.reset_peak()           # reset vitesse peak aussi
+            self.hud.reset_peak()
         if self.keyboard.consommer_decollage():    self._decollage()
         if self.keyboard.consommer_atterrissage(): self._atterrissage()
         if self.keyboard.consommer_home():         self._retour_home()
 
         self._update_mode()
-        self._appliquer_pids()
-        physics_update(s, DT)
+        self._appliquer_pids(dt)      # ← dt réel
+        physics_update(s, dt)         # ← dt réel
 
         if self.hil and HIL_DISPONIBLE and hasattr(s, 'exporter_telemetrie'):
-            self.hil.envoyer(s.exporter_telemetrie())
+            tel = s.exporter_telemetrie()
+            self.hud.set_last_telem(tel)
+            self.hil.envoyer(tel)
+        if self.hil_serial:
+            self.hil_serial.envoyer(s)
 
         self.hud.tick_smooth()
         self.hud.update()
@@ -1449,12 +1482,12 @@ class MainWindow(QMainWindow):
                 s.moteurs       = [0.0, 0.0, 0.0, 0.0]
                 s.cmd_throttle  = 0.0
 
-    def _appliquer_pids(self):
+    def _appliquer_pids(self, dt: float):    # ← dt en paramètre
         s = self.state
         if s.mode_vol in (DroneState.MODE_SOL, DroneState.MODE_URGENCE):
             return
 
-        correction_alt = self.pids.altitude.calculer(s.cible_altitude, s.position.z, DT)
+        correction_alt = self.pids.altitude.calculer(s.cible_altitude, s.position.z, dt)
         s.cmd_throttle = _clamp(THROTTLE_HOVER + correction_alt, 0.0, 1.0)
 
         if s.mode_vol not in (DroneState.MODE_VOL, DroneState.MODE_DECOLLAGE):
@@ -1467,15 +1500,14 @@ class MainWindow(QMainWindow):
         consigne_vx_monde =  cvx * cy_v + cvy * sy_v
         consigne_vy_monde = -cvx * sy_v + cvy * cy_v
 
-        angle_pitch_cible = self.pids.vel_y.calculer(consigne_vy_monde, s.vitesse.y, DT)
-        angle_roll_cible  = self.pids.vel_x.calculer(consigne_vx_monde, s.vitesse.x, DT)
+        angle_pitch_cible = self.pids.vel_y.calculer(consigne_vy_monde, s.vitesse.y, dt)
+        angle_roll_cible  = self.pids.vel_x.calculer(consigne_vx_monde, s.vitesse.x, dt)
 
         from physics_engine import PITCH_MAX, ROLL_MAX
         s.cmd_pitch = _clamp(angle_pitch_cible / PITCH_MAX, -1.0, 1.0)
         s.cmd_roll  = _clamp(angle_roll_cible  / ROLL_MAX,  -1.0, 1.0)
 
         from keyboard_controller import YAW_RATE_MAX
-        # YAW_SCALE réduit la sensibilité de rotation (0.45 = 55% plus lent)
         s.cmd_yaw = _clamp(
             self.keyboard.consigne_yaw_rate / YAW_RATE_MAX * YAW_SCALE,
             -1.0, 1.0)
@@ -1492,7 +1524,6 @@ class MainWindow(QMainWindow):
             self.hud.update()
         elif key == Qt.Key.Key_J:
             self.hud.toggle_day_mode()
-            # Adapter la couleur de fond de la fenêtre au mode
             if self.hud._day_mode:
                 self.setStyleSheet("background-color: #C8C4BC;")
             else:
@@ -1509,4 +1540,12 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
+
+    video = cv2.VideoCapture(0)
+    while True:
+        ret, img1 = video.read()
+        comparateur = image_Comparateur(img1)
+        teste = comparateur.detect_personne()
+        comparateur.affiche()
+
     sys.exit(app.exec())

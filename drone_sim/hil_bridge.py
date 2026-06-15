@@ -3,11 +3,16 @@
 # Hardware-In-the-Loop Bridge — non-bloquant, 50 Hz
 #
 # Deux canaux indépendants :
-#   ① UDP  → IA observatrice (même machine ou réseau local)
+#   ① UDP  → ESP32 #1 (JSON aplati, compatible parseJSON côté Arduino)
 #   ② Serial → carte physique (STM32, ESP32, Pixhawk…)
 #
-# Protocole UDP  : JSON brut, un paquet par tick, port configurable
+# Protocole UDP  : JSON aplati, un paquet par tick, port configurable
 # Protocole Serial : trame binaire compacte (46 octets) + checksum XOR
+#
+# Format JSON envoyé en UDP (compatible telemetry_sender.cpp) :
+# {"alt":1.5,"vz":-0.02,"vx":0.0,"vy":0.0,"roll":0.01,"pitch":0.02,"yaw":0.5,
+#  "bat_pct":98.5,"bat_v":12.4,"m0":0.55,"m1":0.55,"m2":0.55,"m3":0.55,
+#  "mode":1,"throttle":0.55,"dist":0.0}
 #
 # Trame Serial (46 octets) :
 #   [0]     0xAB            — header
@@ -42,14 +47,13 @@
 # =============================================================================
 
 import json
-import math
 import socket
 import struct
 import threading
 import queue
 import time
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 log = logging.getLogger("HIL")
@@ -63,35 +67,35 @@ log = logging.getLogger("HIL")
 class HilConfig:
     # ── UDP ──────────────────────────────────────────────────────────────
     udp_actif      : bool  = True
-    udp_host       : str   = "127.0.0.1"   # IP de l'IA (localhost par défaut)
-    udp_port       : int   = 5005          # port d'écoute côté IA
-    udp_timeout_s  : float = 0.0           # 0 = non-bloquant (sendto best-effort)
+    udp_host       : str   = "192.168.4.1"  # IP de l'ESP32 #1 (AP mode)
+    udp_port       : int   = 1234           # port d'écoute côté ESP32
+    udp_timeout_s  : float = 0.0            # 0 = non-bloquant (sendto best-effort)
 
     # ── Serial ───────────────────────────────────────────────────────────
-    serial_actif   : bool  = False         # False tant que la carte n'est pas branchée
-    serial_port    : str   = "/dev/ttyUSB0"  # Linux : /dev/ttyUSB0 | Windows : COM3
+    serial_actif   : bool  = False          # False tant que la carte n'est pas branchée
+    serial_port    : str   = "/dev/ttyUSB0" # Linux : /dev/ttyUSB0 | Windows : COM3
     serial_baud    : int   = 115200
-    serial_timeout : float = 0.01         # lecture non-bloquante
+    serial_timeout : float = 0.01           # lecture non-bloquante
 
     # ── Général ──────────────────────────────────────────────────────────
-    queue_max      : int   = 4            # profondeur queue Serial (drops si pleine)
-    log_interval_s : float = 5.0          # fréquence des stats dans les logs
+    queue_max      : int   = 4              # profondeur queue Serial (drops si pleine)
+    log_interval_s : float = 5.0            # fréquence des stats dans les logs
 
 
 # ---------------------------------------------------------------------------
-# Codes mode_vol → uint8 pour la trame Serial
+# Correspondance mode_vol string → uint8
 # ---------------------------------------------------------------------------
 
 MODE_CODE = {
-    "SOL":      0,
+    "SOL":       0,
     "DECOLLAGE": 1,
-    "VOL":      2,
-    "ATTERRO":  3,
-    "URGENCE":  4,
+    "VOL":       2,
+    "ATTERRO":   3,
+    "URGENCE":   4,
 }
 
-HEADER_A = 0xAB
-HEADER_B = 0xCD
+HEADER_A  = 0xAB
+HEADER_B  = 0xCD
 TRAME_LEN = 46   # octets, checksum inclus
 
 
@@ -101,35 +105,43 @@ TRAME_LEN = 46   # octets, checksum inclus
 
 class HilBridge:
     """
-    Point d'entrée unique pour l'envoi de télémétrie vers l'IA et la carte.
+    Point d'entrée unique pour l'envoi de télémétrie vers l'ESP32 et la carte.
 
     Thread-safe : seule la méthode envoyer() est appelée depuis le thread Qt.
     Le Serial tourne dans son propre thread pour ne jamais bloquer le timer.
     L'UDP est non-bloquant dans le thread Qt (sendto immédiat).
+
+    Format UDP :
+        Le dict telemetrie (structure interne avec pos[], vel[], att_rad[])
+        est aplati en JSON plat avant envoi, compatible avec parseJSON()
+        dans telemetry_sender.cpp :
+        {"alt":…,"vx":…,"vy":…,"vz":…,"roll":…,"pitch":…,"yaw":…,
+         "bat_pct":…,"bat_v":…,"m0":…,"m1":…,"m2":…,"m3":…,
+         "mode":<int>,"throttle":…,"dist":…}
     """
 
     def __init__(self, config: Optional[HilConfig] = None):
-        self.cfg    = config or HilConfig()
-        self.actif  = False
+        self.cfg   = config or HilConfig()
+        self.actif = False
 
         # ── Compteurs de diagnostic ──────────────────────────────────
-        self._frame_count      = 0
-        self._udp_sent         = 0
-        self._udp_errors       = 0
-        self._serial_sent      = 0
-        self._serial_drops     = 0
-        self._serial_errors    = 0
-        self._t_dernier_log    = 0.0
-        self._latence_udp_ms   = 0.0   # mesure EWMA
+        self._frame_count    = 0
+        self._udp_sent       = 0
+        self._udp_errors     = 0
+        self._serial_sent    = 0
+        self._serial_drops   = 0
+        self._serial_errors  = 0
+        self._t_dernier_log  = 0.0
+        self._latence_udp_ms = 0.0   # mesure EWMA
 
         # ── UDP socket (non-bloquant) ────────────────────────────────
         self._sock_udp: Optional[socket.socket] = None
 
         # ── Serial ──────────────────────────────────────────────────
-        self._serial_queue: queue.Queue = queue.Queue(maxsize=self.cfg.queue_max)
+        self._serial_queue : queue.Queue         = queue.Queue(maxsize=self.cfg.queue_max)
         self._serial_thread: Optional[threading.Thread] = None
-        self._serial_stop   = threading.Event()
-        self._port_serial   = None   # pyserial.Serial, ouvert dans le thread
+        self._serial_stop  = threading.Event()
+        self._port_serial  = None   # pyserial.Serial, ouvert dans le thread
 
     # ------------------------------------------------------------------
     # Cycle de vie
@@ -158,8 +170,10 @@ class HilBridge:
         self.actif = False
 
         if self._sock_udp:
-            try: self._sock_udp.close()
-            except: pass
+            try:
+                self._sock_udp.close()
+            except Exception:
+                pass
             self._sock_udp = None
 
         if self._serial_thread and self._serial_thread.is_alive():
@@ -207,7 +221,7 @@ class HilBridge:
             "latence_udp_ms" : round(self._latence_udp_ms, 2),
             "udp_ok"         : self._sock_udp is not None,
             "serial_ok"      : (self._port_serial is not None
-                                and getattr(self._port_serial, 'is_open', False)),
+                                and getattr(self._port_serial, "is_open", False)),
         }
 
     # ==================================================================
@@ -224,18 +238,66 @@ class HilBridge:
             log.error("UDP open failed: %s", e)
             self._sock_udp = None
 
+    @staticmethod
+    def _aplatir_telemetrie(t: dict) -> dict:
+        """
+        Convertit la structure interne (pos[], vel[], att_rad[], mode string)
+        en dict plat compatible avec parseJSON() sur l'ESP32.
+
+        Champs produits :
+            alt, vx, vy, vz       — position z et vélocités
+            roll, pitch, yaw      — attitudes en radians
+            bat_pct, bat_v        — batterie
+            m0, m1, m2, m3        — moteurs 0.0–1.0
+            mode                  — entier (0=SOL … 4=URGENCE)
+            throttle, dist        — commandes / capteur distance
+        """
+        pos = t.get("pos",     [0.0, 0.0, 0.0])
+        vel = t.get("vel",     [0.0, 0.0, 0.0])
+        att = t.get("att_rad", [0.0, 0.0, 0.0])
+        mot = t.get("moteurs", [0.0, 0.0, 0.0, 0.0])
+
+        # mode peut être une string ("SOL") ou déjà un int
+        mode_raw  = t.get("mode", "SOL")
+        mode_int  = MODE_CODE.get(mode_raw, mode_raw) if isinstance(mode_raw, str) \
+                    else int(mode_raw)
+
+        return {
+            "alt"     : float(pos[2]),
+            "vx"      : float(vel[0]),
+            "vy"      : float(vel[1]),
+            "vz"      : float(vel[2]),
+            "roll"    : float(att[0]),
+            "pitch"   : float(att[1]),
+            "yaw"     : float(att[2]),
+            "bat_pct" : float(t.get("bat_pct",  100.0)),
+            "bat_v"   : float(t.get("bat_v",    12.6)),
+            "m0"      : float(mot[0]),
+            "m1"      : float(mot[1]),
+            "m2"      : float(mot[2]),
+            "m3"      : float(mot[3]),
+            "mode"    : mode_int,           # ← entier, pas string
+            "throttle": float(t.get("throttle", 0.0)),
+            "dist"    : float(t.get("dist",     0.0)),
+        }
+
     def _envoyer_udp(self, telemetrie: dict):
         try:
-            t0  = time.monotonic()
-            payload = json.dumps(telemetrie, separators=(',', ':')).encode()
-            self._sock_udp.sendto(payload,
-                                  (self.cfg.udp_host, self.cfg.udp_port))
-            # EWMA latence (mesure uniquement le sérialisation + sendto)
+            t0 = time.monotonic()
+
+            # Aplatir avant sérialisation JSON
+            plat    = self._aplatir_telemetrie(telemetrie)
+            payload = json.dumps(plat, separators=(',', ':')).encode()
+
+            self._sock_udp.sendto(payload, (self.cfg.udp_host, self.cfg.udp_port))
+
+            # EWMA latence (sérialisation + sendto)
             dt_ms = (time.monotonic() - t0) * 1000.0
             self._latence_udp_ms = 0.9 * self._latence_udp_ms + 0.1 * dt_ms
             self._udp_sent += 1
+
         except BlockingIOError:
-            # Buffer réseau plein — on drop silencieusement, pas grave à 50 Hz
+            # Buffer réseau plein — drop silencieux, pas grave à 50 Hz
             self._udp_errors += 1
         except OSError as e:
             self._udp_errors += 1
@@ -264,10 +326,14 @@ class HilBridge:
             self._serial_queue.put_nowait(trame)
         except queue.Full:
             # Vide la plus vieille, insère la nouvelle
-            try: self._serial_queue.get_nowait()
-            except queue.Empty: pass
-            try: self._serial_queue.put_nowait(trame)
-            except queue.Full: pass
+            try:
+                self._serial_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._serial_queue.put_nowait(trame)
+            except queue.Full:
+                pass
             self._serial_drops += 1
 
     def _serial_worker(self):
@@ -304,17 +370,21 @@ class HilBridge:
             except Exception as e:
                 log.warning("Serial write error: %s — reconnexion", e)
                 self._serial_errors += 1
-                try: self._port_serial.close()
-                except: pass
+                try:
+                    self._port_serial.close()
+                except Exception:
+                    pass
                 self._port_serial = None
 
-        # Nettoyage
+        # Nettoyage à l'arrêt
         if self._port_serial and self._port_serial.is_open:
-            try: self._port_serial.close()
-            except: pass
+            try:
+                self._port_serial.close()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
-    # Encodage trame binaire (46 octets)
+    # Encodage trame binaire (46 octets) — canal Serial
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -325,12 +395,15 @@ class HilBridge:
         Format (46 octets) :
           2B header | 2B counter | 10×float32 (40B) | 1B mode | 1B XOR checksum
         """
-        pos  = t.get("pos",  [0.0, 0.0, 0.0])
-        vel  = t.get("vel",  [0.0, 0.0, 0.0])
+        pos  = t.get("pos",     [0.0, 0.0, 0.0])
+        vel  = t.get("vel",     [0.0, 0.0, 0.0])
         att  = t.get("att_rad", [0.0, 0.0, 0.0])
-        tps  = t.get("t",    0.0)
-        mode = MODE_CODE.get(t.get("mode", "SOL"), 0)
-        cnt  = t.get("_cnt", 0) & 0xFFFF   # compteur de trame
+        tps  = float(t.get("t", 0.0))
+        cnt  = int(t.get("_cnt", 0)) & 0xFFFF
+
+        mode_raw = t.get("mode", "SOL")
+        mode     = MODE_CODE.get(mode_raw, mode_raw) if isinstance(mode_raw, str) \
+                   else int(mode_raw)
 
         # Pack : header(2) + counter(2) + 10 floats(40) + mode(1) = 45 octets
         body = struct.pack(
@@ -338,9 +411,9 @@ class HilBridge:
             HEADER_A, HEADER_B,
             cnt,
             tps,
-            pos[0], pos[1], pos[2],
-            vel[0], vel[1], vel[2],
-            att[0], att[1], att[2],
+            float(pos[0]), float(pos[1]), float(pos[2]),
+            float(vel[0]), float(vel[1]), float(vel[2]),
+            float(att[0]), float(att[1]), float(att[2]),
             mode
         )
 
