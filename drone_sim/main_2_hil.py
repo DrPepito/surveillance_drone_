@@ -1108,7 +1108,7 @@ class HUDWidget(QWidget):
         elif pct > BAT_CRIT_PCT:
             bat_status, status_col = "⚠ CRITIQUE", self.C_RED
         else:
-            bat_status = "⛔ URGENCE BAT" if self._blink_on(20) else ""
+            bat_status = "!!! URGENCE BAT" if self._blink_on(20) else ""
             status_col = self.C_RED
         p.setPen(QPen(status_col)); p.setFont(QFont("Monospace", 7, QFont.Weight.Bold))
         p.drawText(bat_x, jau_y+jau_h2+32, jau_w2, 10,
@@ -1275,7 +1275,7 @@ class HUDWidget(QWidget):
             p.setPen(QPen(self.C_CYAN)); p.drawText(ox, yy, titre); yy += 12
             p.setFont(QFont("Monospace", 7))
             for v in vals:
-                p.setPen(QPen(self.C_WHITE)); p.drawText(ox+4, yy, v); yy += 11
+                p.setPen(QPen(self.C_WHITE)); p.drawText(ox+4, yy, v); yy += 11                      
             yy += 4; y_col[col] = yy; col = 1 - col
         y_o = max(y_col[0], y_col[1])
 
@@ -1535,17 +1535,72 @@ class MainWindow(QMainWindow):
             self.keyboard.key_release(event.key())
 
 
+## Modifications à appliquer dans main_combined.py ###
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# 1) Remplacer le bloc final (lecture webcam locale) par ceci :
+# ─────────────────────────────────────────────────────────────────────────
+ 
+# AVANT (webcam locale, ne reflète pas la vue du drone) :
+#
+#   video = cv2.VideoCapture(0)
+#   while True:
+#       ret, img1 = video.read()
+#       comparateur = image_Comparateur(img1)
+#       teste = comparateur.detect_personne()
+#       comparateur.affiche()
+ 
+# APRÈS (flux caméra du drone, reçu via UART multiplexé) :
+ 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
-
-    video = cv2.VideoCapture(0)
-    while True:
-        ret, img1 = video.read()
-        comparateur = image_Comparateur(img1)
-        teste = comparateur.detect_personne()
-        comparateur.affiche()
-
+ 
+    # Boucle de traitement IA sur le flux caméra du drone.
+    # w.hil_serial est l'instance HilBridgeSerial déjà créée dans MainWindow,
+    # qui reçoit en parallèle (thread dédié) les images relayées par ESP32 #1.
+    def boucle_vision():
+        while True:
+            img = w.hil_serial.derniere_image()
+            if img is not None:
+                comparateur = image_Comparateur(img)
+                comparateur.detect_personne()
+                comparateur.affiche()
+            # Pas de sleep agressif : derniere_image() est non-bloquant,
+            # mais on évite de tourner à vide en boucle serrée si pas d'image.
+            else:
+                cv2.waitKey(10)
+ 
+    import threading
+    thread_vision = threading.Thread(target=boucle_vision, daemon=True)
+    thread_vision.start()
+ 
     sys.exit(app.exec())
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# 2) Pourquoi un thread séparé pour la vision ?
+# ─────────────────────────────────────────────────────────────────────────
+#
+# L'ancienne boucle "while True: video.read()" était BLOQUANTE et tournait
+# dans le thread principal, ce qui empêchait Qt (app.exec()) de jamais être
+# atteint — la fenêtre ne s'affichait jamais réellement avec ce design.
+#
+# En la déplaçant dans un thread dédié, Qt peut gérer sa propre boucle
+# d'événements (rendu HUD à 50 Hz) en parallèle de la détection IA,
+# sans que l'un bloque l'autre.
+#
+# Le HilBridgeSerial lui-même a déjà son propre thread de lecture UART
+# (voir hil_bridge_serial.py), donc derniere_image() est juste une lecture
+# rapide protégée par lock — aucun risque de bloquer la boucle vision
+# en attendant des données série.
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────────
+# 3) Rien à changer dans MainWindow.__init__ : 
+#    self.hil_serial = HilBridgeSerial(port="COM7") existe déjà
+#    et gère maintenant AUSSI la réception (image + RC) automatiquement.
+# ─────────────────────────────────────────────────────────────────────────
+ 

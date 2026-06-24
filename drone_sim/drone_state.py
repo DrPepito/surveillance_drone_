@@ -1,16 +1,21 @@
 # =============================================================================
-# drone_state.py  (version HIL)
+# drone_state.py  (version HIL v2)
 # État complet du drone à chaque instant T
-# Ajout par rapport à la version originale :
-#   - exporter_telemetrie() → dict JSON-sérialisable pour HilBridge
-#   - _frame_cnt            → compteur de trame (uint16, wrapping)
+#
+# Corrections v2 :
+#   ✓ MODE_HOME documenté dans exporter_telemetrie()
+#   ✓ HIST_SIZE constante de classe (plus de N local)
+#   ✓ cible_yaw supprimé (champ mort)
+#   ✓ mode_vol protégé par property + setter validant
+#   ✓ distance_origine 2D documentée explicitement
+#   ✓ MODES_VALIDES comme ensemble de classe
 # =============================================================================
 
 import math
 
 
 class Vec3:
-    """Vecteur 3D — opérations de base dont on a besoin, c'est tout."""
+    """Vecteur 3D — opérations de base."""
 
     def __init__(self, x=0.0, y=0.0, z=0.0):
         self.x = float(x)
@@ -30,21 +35,39 @@ class Vec3:
 class DroneState:
     """
     Toute la donnée du drone à un instant donné.
-    Séparé en blocs clairs : cinématique / attitude / commandes / systèmes.
     Unités SI : mètres, m/s, radians.
+
+    Blocs :
+      - Cinématique  : position, vitesse, accélération
+      - Attitude     : roll, pitch, yaw + vitesses angulaires
+      - Commandes    : cmd_roll/pitch/yaw/throttle
+      - Moteurs      : [M1..M4] normalisés 0-1
+      - Batterie     : pct, tension, mah, courant
+      - Systèmes     : mode_vol, temps, distance
+      - PID          : cible_altitude
+      - Historique   : buffers graphiques (HIST_SIZE points)
     """
 
-    # Modes de vol
+    # ── Modes de vol ──────────────────────────────────────────────────
     MODE_SOL       = "SOL"
     MODE_DECOLLAGE = "DECOLLAGE"
     MODE_VOL       = "VOL"
     MODE_ATTERRO   = "ATTERRO"
     MODE_URGENCE   = "URGENCE"
+    MODE_HOME      = "HOME"
+
+    MODES_VALIDES  = {
+        MODE_SOL, MODE_DECOLLAGE, MODE_VOL,
+        MODE_ATTERRO, MODE_URGENCE, MODE_HOME
+    }
+
+    # ── Taille buffer historique — référence unique ───────────────────
+    HIST_SIZE = 200
 
     def __init__(self):
 
         # --- Cinématique ---
-        self.position     = Vec3()   # x=droite y=avant z=altitude (m)
+        self.position     = Vec3()   # x=droite, y=avant, z=altitude (m)
         self.vitesse      = Vec3()   # m/s
         self.acceleration = Vec3()   # m/s²
 
@@ -65,7 +88,7 @@ class DroneState:
         self.cmd_throttle = 0.0
 
         # --- Moteurs quadcopter X-frame (0.0 → 1.0) ---
-        self.moteurs = [0.0, 0.0, 0.0, 0.0]
+        self.moteurs       = [0.0, 0.0, 0.0, 0.0]
         self.moteurs_armes = False
 
         # --- Batterie ---
@@ -75,16 +98,17 @@ class DroneState:
         self.batterie_courant = 0.0
 
         # --- Systèmes ---
-        self.mode_vol         = DroneState.MODE_SOL
+        self._mode_vol        = DroneState.MODE_SOL   # accès via property
         self.temps_vol        = 0.0
-        self.distance_origine = 0.0
+        self.distance_origine = 0.0   # distance 2D horizontale depuis (0,0)
+                                      # Z ignoré volontairement (usage radar)
 
-        # --- Consignes internes PID ---
+        # --- Consigne PID altitude ---
         self.cible_altitude = 0.0
-        self.cible_yaw      = 0.0
+        # Note : cible_yaw supprimé — aucun PID ne l'utilisait
 
-        # --- Historique graphiques ---
-        N = 200
+        # --- Historique graphiques (HIST_SIZE points) ---
+        N = DroneState.HIST_SIZE
         self.hist_altitude  = [0.0] * N
         self.hist_vitesse_z = [0.0] * N
         self.hist_roll      = [0.0] * N
@@ -92,6 +116,23 @@ class DroneState:
 
         # --- Compteur de trame HIL (uint16 wrapping) ---
         self._frame_cnt = 0
+
+    # ------------------------------------------------------------------
+    # Property mode_vol — validation à l'écriture
+    # ------------------------------------------------------------------
+
+    @property
+    def mode_vol(self) -> str:
+        return self._mode_vol
+
+    @mode_vol.setter
+    def mode_vol(self, val: str):
+        if val not in DroneState.MODES_VALIDES:
+            raise ValueError(
+                f"Mode de vol invalide : '{val}'. "
+                f"Valeurs acceptées : {DroneState.MODES_VALIDES}"
+            )
+        self._mode_vol = val
 
     # ------------------------------------------------------------------
     # Historique / distance
@@ -107,6 +148,11 @@ class DroneState:
         push(self.hist_pitch,     math.degrees(self.pitch))
 
     def update_distance(self):
+        """
+        Distance horizontale 2D depuis l'origine (0, 0).
+        Z volontairement ignoré : usage radar et alertes de zone.
+        Pour une distance 3D : sqrt(x²+y²+z²).
+        """
         self.distance_origine = math.sqrt(
             self.position.x**2 + self.position.y**2)
 
@@ -116,24 +162,24 @@ class DroneState:
 
     def exporter_telemetrie(self) -> dict:
         """
-        Retourne un dict entièrement JSON-sérialisable (float, list, str, int).
+        Retourne un dict entièrement JSON-sérialisable.
         Appelé par HilBridge.envoyer() à chaque tick 50 Hz.
 
         Champs :
           t          — temps de vol (s)
           pos        — [x, y, z] position monde (m)
           vel        — [vx, vy, vz] vitesse monde (m/s)
-          att_rad    — [roll, pitch, yaw] en radians
-          att_deg    — [roll, pitch, yaw] en degrés  (commodité pour l'IA)
-          att_rate   — [roll_rate, pitch_rate, yaw_rate] (rad/s)
-          acc        — [ax, ay, az] accélération (m/s²)
+          att_rad    — [roll, pitch, yaw] radians
+          att_deg    — [roll, pitch, yaw] degrés
+          att_rate   — [roll_rate, pitch_rate, yaw_rate] rad/s
+          acc        — [ax, ay, az] accélération m/s²
           moteurs    — [M1, M2, M3, M4] puissance normalisée [0-1]
-          cmd        — {throttle, roll, pitch, yaw} commandes normalisées
+          cmd        — {throttle, roll, pitch, yaw} normalisés
           cible_alt  — consigne altitude PID (m)
           bat_pct    — batterie (%)
           bat_v      — tension batterie (V)
           bat_mah    — capacité consommée (mAh)
-          mode       — "SOL"|"DECOLLAGE"|"VOL"|"ATTERRO"|"URGENCE"
+          mode       — "SOL"|"DECOLLAGE"|"VOL"|"ATTERRO"|"URGENCE"|"HOME"
           arme       — bool moteurs armés
           _cnt       — compteur de trame uint16
         """
@@ -180,7 +226,11 @@ class DroneState:
     # ------------------------------------------------------------------
 
     def reset(self):
-        """Touche R — remet à l'origine sans perdre le cap."""
+        """
+        Touche R — remet à l'état initial sans perdre le cap (yaw).
+        Le keyboard_controller gèle ses consignes au tick suivant
+        via le guard MODE_SOL dans update().
+        """
         yaw_sauvegarde = self.yaw
         self.__init__()
         self.yaw = yaw_sauvegarde

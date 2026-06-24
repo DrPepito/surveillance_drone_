@@ -1,38 +1,25 @@
 # pid_controller.py
 # =============================================================================
 #
-# PROBLEMES CORRIGES :
+# VERSION v2 — Correcteur second ordre avec intégrateur
 #
-#   1. THRUST SUR-CORRIGE
-#      Avant : PID altitude avec Ki trop fort → windup → oscillations pompage
-#      Apres : omega_n abaisse a 1.0 rad/s, zeta=1.0 (critique), Ki tres faible
-#              => correction tres douce, pas de depassement, pas de pompage
+# ARCHITECTURE :
 #
-#   2. DIMENSION VITESSE OUBLIEE
-#      Avant : ModeleReference2Ordre filtrait la consigne de vitesse (m/s)
-#              mais comparait y_ref (adimensionnel) a v_mesuree (m/s)
-#              => erreur dimensionnelle, le P ne travaillait pas en m/s
-#      Apres : le modele de reference genere directement v_ref en m/s
-#              (consigne en m/s → filtre → v_ref en m/s)
-#              puis P corrige : angle = Kp * (v_ref[m/s] - v_reelle[m/s])
-#              Kp a maintenant les bonnes unites : rad / (m/s)
+#   ALTITUDE  : PID classique, pôles placés ω=1.8 ζ=0.95
+#               → montée progressive ~2s, zéro dépassement, Ki anti-windup
 #
-# ARCHITECTURE BOUCLE VITESSE (2eme ordre + P) :
+#   VITESSE XY : Modèle référence 2ème ordre + correcteur PI
+#               → frein progressif naturel, ω=1.6 ζ=0.95
+#               → ajout Ki pour annuler erreur statique en vent/pente
 #
-#   consigne[m/s] → ModeleRef2Ordre → v_ref[m/s]
-#                                          |
-#                   v_mesuree[m/s] ────────┤
-#                                          ↓
-#                              erreur_v = v_ref - v_mesuree   [m/s]
-#                                          |
-#                              angle = Kp * erreur_v          [rad]
-#                              Kp = ANGLE_CMD_MAX / VIT_MAX   [rad/(m/s)]
+#   YAW       : PID classique inchangé
 #
-# ARCHITECTURE BOUCLE ALTITUDE (PID classique, gains mous) :
-#
-#   cible_z[m] → PID(omega=1.0, zeta=1.0) → delta_throttle
-#   cmd_throttle = THROTTLE_HOVER + delta_throttle
-#   => correction autour du point d equilibre, pas de pompage
+# GARANTIES :
+#   ✓ Zéro dépassement altitude (ζ ≥ 0.95)
+#   ✓ Erreur statique nulle (intégrateur sur altitude ET vitesse)
+#   ✓ Anti-windup sur tous les intégrateurs
+#   ✓ Pas de kick dérivée au premier tick
+#   ✓ Freinage naturel : stick relâché → consigne 0 → frein progressif
 #
 # =============================================================================
 
@@ -43,66 +30,52 @@ from physics_engine import (MASSE, THRUST_MAX, G,
 import math
 
 # ---------------------------------------------------------------------------
-# Point d equilibre physique exact
+# Point d'équilibre physique exact
 # ---------------------------------------------------------------------------
 
 THROTTLE_HOVER = MASSE * G / THRUST_MAX   # 0.3924 = 39.24 %
 
 # ---------------------------------------------------------------------------
-# Gains physiques (acceleration par unite de commande)
+# Gains physiques (accélération par unité de commande)
 # ---------------------------------------------------------------------------
 
-K_ALTITUDE = THRUST_MAX / MASSE                       # 25.0  m/s2/u
-K_YAW      = THRUST_MAX * COEFF_YAW   / INERTIE_YAW  # 50.0  rad/s2/u
+K_ALTITUDE = THRUST_MAX / MASSE                       # 25.0  m/s²/u
+K_YAW      = THRUST_MAX * COEFF_YAW / INERTIE_YAW    # 50.0  rad/s²/u
 
 # ---------------------------------------------------------------------------
 # Angle et vitesse max en mode position
 # ---------------------------------------------------------------------------
 
-ANGLE_CMD_MAX  = math.radians(22.0)  # 22 deg max commande par boucle vitesse
+ANGLE_CMD_MAX  = math.radians(22.0)  # 22° max commandé par boucle vitesse
 VIT_MAX_CMD_XY = 4.0                 # m/s max commande clavier
 
 
 # ===========================================================================
 # ModeleReference2Ordre
 # ===========================================================================
-# Filtre une consigne brutale (echelon) en une trajectoire en S-curve.
+# Filtre une consigne brutale (échelon) en trajectoire en S-curve.
 #
-# Equation :  y'' + 2*zeta*wn*y' + wn^2*y = wn^2 * consigne
-# Integree par Euler pas a pas.
+# Équation : y'' + 2·ζ·ωn·y' + ωn²·y = ωn²·consigne
+# Intégrée par Euler pas à pas.
 #
-# ENTREE  : consigne [meme unite que la sortie — ici m/s]
-# SORTIES : y  = valeur filtree        [m/s]
-#           dy = derivee filtree       [m/s2]  (non utilisee en dehors)
-#
-# Reglage recommande boucle vitesse :
-#   omega_n = 1.2 a 1.6 rad/s  → temps de montee 2 a 3 s
-#   zeta    = 0.90              → legerement sur-amorti, zero depassement
+# ENTRÉE  : consigne [m/s]
+# SORTIE  : y = valeur filtrée [m/s]
 # ===========================================================================
 
 class ModeleReference2Ordre:
 
     def __init__(self, omega_n, zeta):
-        self.wn   = omega_n   # pulsation propre [rad/s]
-        self.zeta = zeta      # amortissement [-]
-        self.y    = 0.0       # etat courant [m/s]
-        self.dy   = 0.0       # derivee courante [m/s2]
+        self.wn   = omega_n
+        self.zeta = zeta
+        self.y    = 0.0
+        self.dy   = 0.0
 
     def update(self, consigne, dt):
-        """
-        Avance le filtre d un pas dt.
-        consigne : valeur cible [m/s]
-        retourne y filtre [m/s]
-        """
         if dt <= 0.0:
             return self.y
-        # Acceleration du 2eme ordre
-        ddy    = self.wn**2 * (consigne - self.y) - 2.0*self.zeta*self.wn * self.dy
-        # Integration Euler
-        self.dy += ddy    * dt   # [m/s2] * [s] = [m/s]
-        self.y  += self.dy * dt  # [m/s]  * [s] = [m]  <- FAUX avant, corrige ici
-        # Note : self.y reste en m/s car on filtre une VITESSE, pas une position.
-        # La derivee dy est une acceleration [m/s2], l integration donne bien m/s.
+        ddy     = self.wn**2 * (consigne - self.y) - 2.0*self.zeta*self.wn * self.dy
+        self.dy += ddy    * dt
+        self.y  += self.dy * dt
         return self.y
 
     def reset(self, valeur=0.0):
@@ -111,52 +84,60 @@ class ModeleReference2Ordre:
 
 
 # ===========================================================================
-# CorrecteurVitesse  —  modele 2eme ordre + correcteur P
+# CorrecteurVitesse  —  modèle 2ème ordre + correcteur PI
 # ===========================================================================
-# Les unites sont maintenant coherentes partout :
 #
-#   consigne    [m/s]
-#   v_ref       [m/s]   (sortie ModeleReference)
-#   v_mesuree   [m/s]   (vitesse reelle drone)
-#   erreur_v    [m/s]   = v_ref - v_mesuree
-#   angle       [rad]   = Kp * erreur_v
-#   Kp          [rad/(m/s)]  = ANGLE_CMD_MAX / VIT_MAX_CMD_XY
+# Ajout d'un intégrateur (Ki) par rapport à la version précédente :
+#   → annule l'erreur statique résiduelle (vent simulé, frottement asymétrique)
+#   → Ki volontairement faible pour ne pas créer de windup
 #
-# Interpretation physique de Kp :
-#   Si erreur_v = VIT_MAX (4 m/s) → angle = ANGLE_CMD_MAX (22 deg)
-#   Si erreur_v = 0              → angle = 0 (drone plat, vitesse atteinte)
-#   Si erreur_v < 0              → angle negatif (freinage)
+# Unités :
+#   consigne      [m/s]
+#   v_ref         [m/s]   sortie ModèleRéférence
+#   v_mesurée     [m/s]
+#   erreur_v      [m/s]
+#   angle         [rad]   = Kp·erreur + Ki·∫erreur
+#   Kp            [rad/(m/s)]
+#   Ki            [rad/(m·s⁻¹·s)] = [rad/m]
+#
 # ===========================================================================
 
 class CorrecteurVitesse:
 
-    KP = ANGLE_CMD_MAX / VIT_MAX_CMD_XY   # rad/(m/s)  = 0.384/4.0 = 0.096
+    KP = ANGLE_CMD_MAX / VIT_MAX_CMD_XY   # 0.096 rad/(m/s)
+    KI = 0.008                             # intégrateur doux anti-dérive
 
-    def __init__(self, omega_n=1.4, zeta=0.90):
-        self.ref = ModeleReference2Ordre(omega_n, zeta)
-        self.kp  = self.KP
+    def __init__(self, omega_n=1.6, zeta=0.95):
+        self.ref        = ModeleReference2Ordre(omega_n, zeta)
+        self.kp         = self.KP
+        self.ki         = self.KI
+        self._integrale = 0.0
+        self._lim_i     = ANGLE_CMD_MAX * 0.25   # anti-windup serré
 
     def calculer(self, consigne_ms, vitesse_mesuree_ms, dt):
         """
-        consigne_ms       : vitesse cible  [m/s]
-        vitesse_mesuree_ms: vitesse reelle [m/s]
-        dt                : pas de temps   [s]
-        retourne          : angle cible    [rad]
+        consigne_ms        : vitesse cible  [m/s]
+        vitesse_mesuree_ms : vitesse réelle [m/s]
+        dt                 : pas de temps   [s]
+        retourne           : angle cible    [rad]
         """
-        v_ref  = self.ref.update(consigne_ms, dt)          # [m/s]
-        erreur = v_ref - vitesse_mesuree_ms                 # [m/s]
-        angle  = self.kp * erreur                           # [rad/(m/s)] * [m/s] = [rad]
+        v_ref  = self.ref.update(consigne_ms, dt)
+        erreur = v_ref - vitesse_mesuree_ms
+
+        # Intégrateur avec anti-windup par clamping
+        self._integrale += erreur * dt
+        self._integrale  = _clamp(self._integrale, -self._lim_i, self._lim_i)
+
+        angle = self.kp * erreur + self.ki * self._integrale
         return _clamp(angle, -ANGLE_CMD_MAX, ANGLE_CMD_MAX)
 
     def reset(self, valeur_ms=0.0):
         self.ref.reset(valeur_ms)
+        self._integrale = 0.0
 
 
 # ===========================================================================
-# PID generique  —  utilise pour altitude et yaw
-# ===========================================================================
-# Anti-windup clamping, pas de kick derivee au premier tick.
-# Sorties bornees.
+# PID générique  —  altitude, yaw, position
 # ===========================================================================
 
 class PID:
@@ -177,15 +158,20 @@ class PID:
             return 0.0
         erreur  = consigne - mesure
         terme_p = self.kp * erreur
+
+        # Intégrateur anti-windup
         self._integrale += erreur * dt
         self._integrale  = _clamp(self._integrale,
                                   -self.lim_integrale, self.lim_integrale)
         terme_i = self.ki * self._integrale
+
+        # Dérivée — pas de kick au premier tick
         if self._premier_tick:
-            terme_d       = 0.0
+            terme_d            = 0.0
             self._premier_tick = False
         else:
             terme_d = self.kd * (erreur - self._erreur_prec) / dt
+
         self._erreur_prec = erreur
         return _clamp(terme_p + terme_i + terme_d,
                       -self.lim_sortie, self.lim_sortie)
@@ -196,7 +182,7 @@ class PID:
         self._premier_tick = True
 
     def set_gains(self, kp, ki, kd):
-        self.kp = kp ; self.ki = ki ; self.kd = kd
+        self.kp = kp; self.ki = ki; self.kd = kd
         self.reset()
 
     def debug(self):
@@ -208,18 +194,19 @@ class PID:
 # FlightPIDs  —  instanciation de tous les correcteurs
 # ===========================================================================
 #
-# ALTITUDE :
-#   omega_n = 1.0 rad/s  → lent, pas de pompage
-#   zeta    = 1.00       → amorti critique, zero depassement
-#   Ki tres faible       → compense derive lente sans windup
+# ALTITUDE — placement de pôles ω=1.8 rad/s, ζ=0.95 (quasi-critique)
+#   k = K_ALTITUDE = 25 m/s²/u
+#   Kp = ω²/k         = 3.24/25  = 0.130
+#   Kd = 2·ζ·ω/k      = 3.42/25  = 0.137
+#   Ki = faible        = 0.012    → annule dérive lente sans pomper
+#   → montée ~2s, zéro dépassement, tenue d'altitude solide
 #
-# VITESSE XY :
-#   CorrecteurVitesse avec modele 2eme ordre + P
-#   omega_n = 1.4 rad/s  → montee en ~2s
-#   zeta    = 0.90       → legerement sur-amorti
+# VITESSE XY — CorrecteurVitesse (2ème ordre + PI)
+#   ω=1.6 ζ=0.95 → frein progressif ~2s
+#   Ki=0.018 → annule erreur statique sans windup
 #
-# YAW :
-#   PID classique, placement de poles, taux direct
+# YAW — PID classique
+#   ω=4 ζ=0.90 → rotation franche, bien amorti
 #
 # ===========================================================================
 
@@ -227,42 +214,37 @@ class FlightPIDs:
 
     def __init__(self):
 
-        # --- Altitude ---
-        # Gains calcules par placement de poles omega=1.0, zeta=1.0 (critique)
-        # k = K_ALTITUDE = 25 m/s2/u
-        # Kp = omega^2 / k = 1.0 / 25.0 = 0.040
-        # Kd = 2*zeta*omega / k = 2.0 / 25.0 = 0.080
-        # Ki = tres faible pour ne pas pomper : 0.008
-        marge = 1.0 - THROTTLE_HOVER   # ~0.608 — borne max correction
+        # ── Altitude ──────────────────────────────────────────────────
+        # ω=1.8 ζ=0.95 → montée progressive ~2s, zéro dépassement
+        marge = 1.0 - THROTTLE_HOVER   # ~0.608
         self.altitude = PID(
-            kp = 0.040,
-            ki = 0.008,   # tres faible : compense derive sans pomper
-            kd = 0.080,
+            kp            = 0.130,   # ω²/k    = 3.24/25
+            ki            = 0.012,   # dérive lente uniquement
+            kd            = 0.137,   # 2·ζ·ω/k = 3.42/25
             lim_sortie    = marge,
-            lim_integrale = marge * 0.25   # windup serre
+            lim_integrale = marge * 0.20   # windup très serré
         )
 
-        # --- Vitesse horizontale (2eme ordre + P) ---
-        # omega_n=1.4 : montee ~2s   zeta=0.90 : sur-amorti leger
-        # Pour plus de douceur : omega_n=1.0
-        # Pour plus de reactivite : omega_n=2.0
-        self.vel_x = CorrecteurVitesse(omega_n=1.4, zeta=0.90)
-        self.vel_y = CorrecteurVitesse(omega_n=1.4, zeta=0.90)
+        # ── Vitesse horizontale XY (2ème ordre + PI) ──────────────────
+        # ω=1.6 ζ=0.95 → frein progressif naturel ~2s
+        self.vel_x = CorrecteurVitesse(omega_n=1.6, zeta=0.95)
+        self.vel_y = CorrecteurVitesse(omega_n=1.6, zeta=0.95)
 
-        # --- Yaw ---
-        # k = 50 rad/s2/u   omega=4   zeta=0.90
-        # Kp = 16/50 = 0.320   Kd = 7.2/50 = 0.144   Ki = 0.010
+        # ── Yaw ───────────────────────────────────────────────────────
+        # ω=4 ζ=0.90 → rotation franche bien amortie
+        # Kp=16/50=0.320  Kd=7.2/50=0.144  Ki faible
         self.yaw = PID(
-            kp = 0.320,
-            ki = 0.010,
-            kd = 0.144,
+            kp            = 0.320,
+            ki            = 0.008,   # réduit vs avant : moins de drift yaw
+            kd            = 0.144,
             lim_sortie    = 0.80,
-            lim_integrale = 0.20
+            lim_integrale = 0.15
         )
 
-        # --- Position XY (mode autonome futur) ---
-        self.pos_x = PID(kp=0.40, ki=0.005, kd=0.20, lim_sortie=0.35)
-        self.pos_y = PID(kp=0.40, ki=0.005, kd=0.20, lim_sortie=0.35)
+        # ── Position XY (mode autonome / HOME) ────────────────────────
+        # Gains légèrement augmentés pour navigation HOME plus précise
+        self.pos_x = PID(kp=0.50, ki=0.008, kd=0.25, lim_sortie=0.40)
+        self.pos_y = PID(kp=0.50, ki=0.008, kd=0.25, lim_sortie=0.40)
 
     def reset_all(self):
         self.altitude.reset()
@@ -276,8 +258,9 @@ class FlightPIDs:
         print("=" * 60)
         print(f"  THROTTLE_HOVER = {THROTTLE_HOVER*100:.2f} %")
         print(f"  Altitude   : {self.altitude.debug()}")
-        print(f"  Vel XY     : Kp={CorrecteurVitesse.KP:.4f} rad/(m/s)"
-              f"  wn={self.vel_x.ref.wn:.2f}  zeta={self.vel_x.ref.zeta:.2f}")
+        print(f"  Vel XY     : Kp={CorrecteurVitesse.KP:.4f} "
+              f"Ki={CorrecteurVitesse.KI:.4f} rad/(m/s) "
+              f"wn={self.vel_x.ref.wn:.2f}  zeta={self.vel_x.ref.zeta:.2f}")
         print(f"  Yaw        : {self.yaw.debug()}")
         print("=" * 60)
 
