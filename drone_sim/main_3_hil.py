@@ -1438,7 +1438,7 @@ class MainWindow(QMainWindow):
         self.hud         = HUDWidget(self.state)
         
         # on démarre la caméra locale (webcam 0) et on la connecte au HUD
-        self.video_feed = VideoFeed(source=0)
+        self.video_feed = VideoFeed(source=0)  #a remplacer par l url de la esp cam "http://192.168.4.3:81/stream"  ou "http://192.168.4.2:81/stream"  sinon incrementer le 3 ou le decendre en fonction de l impelementation du wifi ça peut changer  sinon guarder 0 pour avoir la webcam
         self.video_feed.demarrer()
         self.hud.set_video(self.video_feed)
 
