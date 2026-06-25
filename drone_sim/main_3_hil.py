@@ -1,5 +1,5 @@
 # =============================================================================
-# main_combined.py  —  version "feature-complete v3"
+# main_3_hil.py
 # =============================================================================
 
 import sys
@@ -43,13 +43,13 @@ ALTITUDE_DECOLLAGE = 1.5
 
 # paramètres de comportement du simulateur, on peut les tweaker facilement ici
 YAW_SCALE          = 0.45    # Réduction sensibilité yaw (0.45 = 55% plus lent)
-SAFETY_DIST        = 25.0    # m — distance max avant zone rouge sur radar
-VARIO_RANGE        = 5.0     # m/s — plage max de l'échelle vario
-GLIDE_SLOPE_DEG    = 5.0     # degrés — angle de référence glide path
-VZ_HARD_LANDING    = 2.5     # m/s — seuil alerte atterrissage dur
-HOVER_VXY_THR      = 0.15    # m/s — seuil détection hovering
-HOVER_VZ_THR       = 0.08    # m/s — seuil vertical hovering
-BAT_CRIT_PCT       = 15.0    # % — seuil batterie critique
+SAFETY_DIST        = 25.0    # m - distance max avant zone rouge sur radar
+VARIO_RANGE        = 5.0     # m/s - plage max de l'échelle vario
+GLIDE_SLOPE_DEG    = 5.0     # degrés - angle de référence glide path
+VZ_HARD_LANDING    = 2.5     # m/s - seuil alerte atterrissage dur
+HOVER_VXY_THR      = 0.15    # m/s - seuil détection hovering
+HOVER_VZ_THR       = 0.08    # m/s - seuil vertical hovering
+BAT_CRIT_PCT       = 15.0    # % - seuil batterie critique
 BAT_DRAIN_ALPHA    = 0.004   # EMA très lente pour drain batterie
 
 
@@ -169,7 +169,7 @@ class Smoothed:
 # le widget principal qui dessine tout le HUD
 class HUDWidget(QWidget):
 
-    # palette nuit (défaut) — tons sombres bleutés, douce pour les yeux
+    # palette nuit (défaut) - tons sombres bleutés, douce pour les yeux
     C_BG_NIGHT     = QColor("#2A2D35")
     C_PANEL_NIGHT  = QColor("#1A1D24")
     C_BORDER_NIGHT = QColor("#2C3245")
@@ -180,7 +180,7 @@ class HUDWidget(QWidget):
     C_SKY_NIGHT    = QColor("#0D2240")
     C_GROUND_NIGHT = QColor("#2A1E08")
 
-    # palette jour — beige chaud cockpit civil, pour voler de jour
+    # palette jour - beige chaud cockpit civil, pour voler de jour
     C_BG_DAY     = QColor("#E8E0D0")
     C_PANEL_DAY  = QColor("#D4C8B4")
     C_BORDER_DAY = QColor("#A89880")
@@ -1268,7 +1268,7 @@ class HUDWidget(QWidget):
 
         p.setFont(QFont("Monospace", 9, QFont.Weight.Bold))
         p.setPen(QPen(self.C_CYAN))
-        p.drawText(OX+8, OY+16, "◈  MODE INGÉNIEUR — HIL BRIDGE")
+        p.drawText(OX+8, OY+16, "◈  MODE INGÉNIEUR - HIL BRIDGE")
         p.setPen(QPen(QColor("#242830"), 0.5))
         p.drawLine(OX+6, OY+22, OX+OW-6, OY+22)
 
@@ -1319,7 +1319,7 @@ class HUDWidget(QWidget):
                   self.C_HIL_ERR)
 
         sep()
-        titre_section("PAYLOAD — CHAMPS DÉCODÉS")
+        titre_section("PAYLOAD - CHAMPS DÉCODÉS")
 
         # on essaie d'abord la dernière trame reçue, sinon on reconstruit depuis l'état
         tel = self._last_telem if self._last_telem else {}
@@ -1426,7 +1426,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Drone Flight Simulator — AZERTY")
+        self.setWindowTitle("Drone Flight Simulator - AZERTY")
         self.setMinimumSize(1200, 820)
         self.setStyleSheet("background-color: #0C0D10;")
 

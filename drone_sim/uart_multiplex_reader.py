@@ -6,14 +6,6 @@
 #   type = 'T' → payload = JSON texte (RC relayées par ESP32 #1)
 #   type = 'I' → payload = JPEG brut (image caméra)
 #
-# Utilisation typique dans main_combined.py :
-#
-#   from uart_multiplex_reader import UartMultiplexReader
-#   reader = UartMultiplexReader(port="COM7")
-#   reader.demarrer()
-#   ...
-#   frame = reader.derniere_image()   # np.ndarray (BGR, prêt pour OpenCV/YOLO) ou None
-#   rc    = reader.derniere_rc()      # dict JSON ou None
 # =============================================================================
 
 import threading

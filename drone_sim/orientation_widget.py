@@ -1,12 +1,6 @@
 # =============================================================================
 # orientation_widget.py
-# Flèche 3D temps réel — indique l'orientation du drone (roll, pitch, yaw)
-# 100% QPainter, zéro OpenGL, zéro bibliothèque externe
-#
-# Principe : on dessine une flèche 3D en projetant ses points 3D
-# sur le plan 2D de l'écran avec une projection isométrique simple.
-# La flèche pointe dans la direction "avant" du drone.
-# Deux axes secondaires (droite = rouge, haut = vert) complètent le repère.
+# tout fait a la manoo 
 # =============================================================================
 
 import math
@@ -20,7 +14,7 @@ print(physics_engine.DRAG_ANG)
 
 # ---------------------------------------------------------------------------
 # Projection isométrique manuelle
-# Angle de vue fixe : az=30°, el=20° — donne une bonne lisibilité
+# Angle de vue fixe : az=30°, el=20°  donne une bonne lisibilité
 # ---------------------------------------------------------------------------
 
 AZ_VUE = math.radians(30)    # azimut caméra

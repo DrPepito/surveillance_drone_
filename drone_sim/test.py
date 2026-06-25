@@ -9,7 +9,7 @@ _model = YOLO("yolov8n.pt")
 # Tester ces URLs selon le firmware de ta caméra :
 # MJPEG stream : http://192.168.4.3/stream  ou  http://192.168.4.3:81/stream
 # JPEG snapshot : http://192.168.4.3/capture
-STREAM_URL = "http://192.168.4.3:81/stream"   #  ajuster si besoin
+STREAM_URL = "http://192.168.4.3:81/stream"   #  ajuster si besoin ça peut etre 2: ou autre a verifier lors de k implementation
 
 
 class image_Comparateur:

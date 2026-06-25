@@ -1,11 +1,7 @@
 # keyboard_controller.py
-# Entrées clavier AZERTY → consignes de VITESSE (mode DJI Position Hold)
+# Entrées clavier AZERTY -->consignes de VITESSE (mode DJI Position Hold)
 #
-# CORRECTIONS v3 :
-#   PAS_VIT_XY_S    6.0  → 2.5   la consigne monte en ~1.6s au lieu de 0.67s
-#   PAS_RETOUR_XY_S 12.0 → 4.0   le freinage est doux, pas brutal
-#   PAS_YAW_S       3.0  → 2.0   yaw un peu plus calme aussi
-#   PAS_RETOUR_YAW_S 5.0 → 3.0
+
 #
 # Règle : la rampe clavier doit être plus lente que le filtre PID (omega_n=1.0 ≈ 1s)
 # sinon on dépasse la trajectoire de référence et ça oscille
@@ -21,13 +17,13 @@ YAW_RATE_MAX     = 1.2    # rad/s yaw max
 
 # rampes d'accélération — volontairement douces pour ne pas dépasser le filtre PID
 # si c'est trop lent à ton goût, remonte PAS_VIT_XY_S mais pas au-dessus de 4.0
-PAS_VIT_XY_S     = 0.8    # m/s²  montée en ~1.6s (était 6.0 → trop rapide)
+PAS_VIT_XY_S     = 0.8    # m/s²  montée en ~1.6s (était 6.0 -->trop rapide)
 PAS_VIT_Z_S      = 0.8    # m/s²
 PAS_YAW_S        = 1    # rad/s² (était 3.0)
 
 # freinage quand on lâche la touche — doit rester proche de PAS_VIT_XY_S
 # un freinage trop brutal par rapport à la montée crée des oscillations au relâché
-PAS_RETOUR_XY_S  = 4.0    # m/s²  (était 12.0 → beaucoup trop brutal)
+PAS_RETOUR_XY_S  = 4.0    # m/s²  (était 12.0 -->beaucoup trop brutal)
 PAS_RETOUR_YAW_S = 3.0    # rad/s² (était 5.0)
 
 Z_HOME_SAFE      = 4.0    # m  altitude sécurité HOME
@@ -39,7 +35,7 @@ class KeyboardController:
     """
     Traduit les touches AZERTY en consignes de vitesse.
     Le PID vel_x/vel_y convertit ensuite ces consignes en angles.
-    Relâche la touche → consigne retombe à 0 → drone freine progressivement.
+    Relâche la touche -->consigne retombe à 0 -->drone freine progressivement.
     """
 
     def __init__(self):

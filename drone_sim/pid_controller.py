@@ -1,25 +1,31 @@
 # pid_controller.py
 # =============================================================================
 #
-# VERSION v2 — Correcteur second ordre avec intégrateur
+# Contrôleurs de vol
 #
-# ARCHITECTURE :
+# Le drone utilise trois types de correcteurs :
 #
-#   ALTITUDE  : PID classique, pôles placés ω=1.8 ζ=0.95
-#               → montée progressive ~2s, zéro dépassement, Ki anti-windup
+# • Altitude :
+#   PID classique permettant de maintenir ou d'atteindre une altitude cible.
+#   Les gains sont réglés pour obtenir une montée progressive et stable,
+#   avec très peu de dépassement et une bonne tenue en stationnaire.
 #
-#   VITESSE XY : Modèle référence 2ème ordre + correcteur PI
-#               → frein progressif naturel, ω=1.6 ζ=0.95
-#               → ajout Ki pour annuler erreur statique en vent/pente
+# • Déplacement horizontal (avant/arrière, gauche/droite) :
+#   Un modèle de référence du second ordre filtre les commandes clavier
+#   (ZQSD) afin d'éviter les changements brusques de vitesse.
+#   Un correcteur PI ajuste ensuite l'inclinaison du drone pour atteindre
+#   la vitesse demandée tout en supprimant les erreurs résiduelles.
 #
-#   YAW       : PID classique inchangé
+# • Lacet (rotation sur lui-même) :
+#   PID classique contrôlant l'orientation du drone autour de l'axe vertical.
+#   Utilisé pour les rotations gauche/droite.
 #
-# GARANTIES :
-#   ✓ Zéro dépassement altitude (ζ ≥ 0.95)
-#   ✓ Erreur statique nulle (intégrateur sur altitude ET vitesse)
-#   ✓ Anti-windup sur tous les intégrateurs
-#   ✓ Pas de kick dérivée au premier tick
-#   ✓ Freinage naturel : stick relâché → consigne 0 → frein progressif
+# Objectifs :
+#   - Commandes fluides au clavier AZERTY 
+#   - Déplacements progressifs et naturels
+#   - Maintien stable de l'altitude
+#   - Freinage automatique lors du relâchement des touches
+#   - Suppression des oscillations et de la dérive lente
 #
 # =============================================================================
 

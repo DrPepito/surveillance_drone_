@@ -1,13 +1,6 @@
 # =============================================================================
-# physics_engine.py  —  v3
-#
-# CORRECTIFS :
-#   • Mixer réécrit : pitch inversé (AV/AR) + ratio asymétrique 60/40
-#     → pitch+ (avancer) booste AR à 60%, réduit AV à 40%
-#     → couple_pitch négatif → angle pitch négatif
-#     → force_y = -thrust*sin(pitch) > 0  ✓ drone avance
-#   • Même logique 60/40 pour roll et yaw
-#   • force_y conserve le signe négatif du correctif v2
+# physics_engine.py   v3
+
 # =============================================================================
 
 import math
